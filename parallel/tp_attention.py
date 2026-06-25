@@ -35,23 +35,67 @@ def _slice_cols(linear, start, end, keep_bias):
 
 
 def shard_attention_(attn, rank, world):
-    """In-place TP shard of one Attention module across `world` ranks."""
+    """In-place TP shard of one Attention module across `world` ranks.
+
+    Query heads are always split (column-parallel to_q + row-parallel to_out).
+    KV heads (G): split if G % world == 0, otherwise REPLICATED on every rank
+    (handles MQA G=1 / GQA G<world; kv projections are tiny so replication is
+    cheap). The processor repeat_interleaves kv to match local query heads.
+    """
     H = attn.heads
-    assert H % world == 0, f"heads {H} not divisible by world {world}"
+    assert H % world == 0, f"query heads {H} not divisible by world {world}"
     head_dim = attn.inner_dim // H
-    kv_heads = attn.inner_kv_dim // head_dim
-    assert kv_heads == H, f"MVP supports MHA only (kv_heads={kv_heads}, heads={H})"
-    local = H // world
-    s, e = rank * local * head_dim, (rank + 1) * local * head_dim
-    _slice_rows(attn.to_q, s, e)
-    _slice_rows(attn.to_k, s, e)
-    _slice_rows(attn.to_v, s, e)
-    _slice_cols(attn.to_out[0], s, e, keep_bias=(rank == 0))
-    # the processor reshapes by attn.heads -> set to this rank's local head count
-    attn.heads = local
-    attn.inner_dim = local * head_dim
-    attn.inner_kv_dim = local * head_dim
+    G = attn.inner_kv_dim // head_dim
+    localH = H // world
+    qs, qe = rank * localH * head_dim, (rank + 1) * localH * head_dim
+    _slice_rows(attn.to_q, qs, qe)
+    if G % world == 0 and G >= world:
+        localG = G // world
+        ks, ke = rank * localG * head_dim, (rank + 1) * localG * head_dim
+        _slice_rows(attn.to_k, ks, ke)
+        _slice_rows(attn.to_v, ks, ke)
+        attn.inner_kv_dim = localG * head_dim
+    # else: G < world (e.g. MQA G=1) -> replicate kv (leave to_k/to_v full)
+    _slice_cols(attn.to_out[0], qs, qe, keep_bias=(rank == 0))
+    attn.heads = localH
+    attn.inner_dim = localH * head_dim
     return attn
+
+
+def _is_attention(m):
+    return (all(hasattr(m, a) for a in
+                ("to_q", "to_k", "to_v", "to_out", "heads", "inner_dim", "inner_kv_dim"))
+            and getattr(m, "to_k", None) is not None
+            and getattr(m, "to_out", None) is not None)
+
+
+def iter_attention_modules(model):
+    """Yield (name, module) for every Attention-like submodule."""
+    for name, m in model.named_modules():
+        if _is_attention(m):
+            yield name, m
+
+
+def tp_supported(attn, world):
+    """True if this Attention can be TP-sharded across `world` ranks.
+
+    Only requirement: query heads divisible by world. KV (MHA/GQA/MQA) is handled
+    by shard-or-replicate.
+    """
+    return attn.heads % world == 0
+
+
+def shard_denoiser_attention_(model, rank, world):
+    """TP-shard every supported Attention in `model`. Returns (sharded, skipped) names."""
+    sharded, skipped = [], []
+    for name, attn in iter_attention_modules(model):
+        if not tp_supported(attn, world):
+            skipped.append(name)
+            continue
+        shard_attention_(attn, rank, world)
+        attn.set_processor(TPAttnProcessor())
+        sharded.append(name)
+    return sharded, skipped
 
 
 class TPAttnProcessor:
@@ -95,9 +139,14 @@ class TPAttnProcessor:
         value = attn.to_v(encoder_hidden_states)
 
         head_dim = query.shape[-1] // attn.heads
+        kv_heads = key.shape[-1] // head_dim
         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, kv_heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, kv_heads, head_dim).transpose(1, 2)
+        if kv_heads != attn.heads:  # GQA/MQA: replicate kv to match local query heads
+            rep = attn.heads // kv_heads
+            key = torch.repeat_interleave(key, rep, dim=1)
+            value = torch.repeat_interleave(value, rep, dim=1)
         if attn.norm_q is not None:
             query = attn.norm_q(query)
         if attn.norm_k is not None:

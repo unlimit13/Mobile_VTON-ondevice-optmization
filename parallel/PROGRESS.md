@@ -4,9 +4,10 @@
 the main denoiser, over the direct wired GbE link between two Pi 5s.
 
 ## ▶ RESUME HERE
-Stage 1 MVP: TP attention math is verified. NEXT = load the real denoiser, walk &
-shard ALL its Attention modules, set TPAttnProcessor, run the pipeline split
-across the 2 Pis (distributed bootstrap), then check 2-Pi output == single-Pi.
+TP attention verified on the REAL denoiser (all 60 modules, MQA-aware). NEXT =
+distributed bootstrap: load denoiser per rank, shard via shard_denoiser_attention_,
+run the FULL pipeline split across the 2 Pis, check 2-Pi output == single-Pi (1
+step), then measure real per-step latency.
 
 ## Setup facts (don't re-derive)
 - rank 0 = this Pi, eth0 `192.168.100.1`; rank 1 = peer, eth0 `192.168.100.2`
@@ -23,13 +24,12 @@ across the 2 Pis (distributed bootstrap), then check 2-Pi output == single-Pi.
 - per attention: exactly 1 all_reduce of [B, S, out_dim]
 
 ## TODO (delete each as done)
-- [ ] Walk + shard ALL Attention modules in a loaded denoiser
 - [ ] Distributed bootstrap for the full pipeline (load denoiser per rank, shard, run)
 - [ ] Equivalence: 2-Pi TP output == single-Pi output (1 step, atol)
 - [ ] Measure real 2-Pi per-step latency (target ~1.8x vs 119s)
 - [ ] Stage 1b: channel-parallel conv (resnet) + all-gather at block boundaries
 - [ ] Stage 2: compute/comm overlap, fuse small all_reduces
-- [ ] (later) GQA/MQA + rope path in TPAttnProcessor (MVP asserts MHA, no rope)
+- [ ] (later) rope path in TPAttnProcessor (not needed yet; GQA/MQA already done)
 - [ ] (later) 4-Pi: 2-way TP x 2-way data-parallel via router
 
 ## Done (terse log)
@@ -39,3 +39,7 @@ across the 2 Pis (distributed bootstrap), then check 2-Pi output == single-Pi.
 - Stage 1 MVP core: TP attention sharding (head-parallel q/k/v + row-parallel
   to_out + all_reduce) verified == full attention, diff ~1e-7 (self & cross).
   `parallel/tp_attention.py`, test `parallel/tp_test_attention.py`.
+- Model is MQA (kv_heads=1, query heads 4/8/14, head_dim 64). TP updated to
+  shard query heads + replicate/shard kv (shard_attention_, tp_supported,
+  TPAttnProcessor now GQA/MQA-aware). Verified on REAL denoiser: all 60
+  Attention modules TP == full, max|diff| 2.2e-5. test `parallel/tp_test_denoiser.py`.
