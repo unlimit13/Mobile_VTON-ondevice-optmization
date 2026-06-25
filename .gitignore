@@ -1,0 +1,16 @@
+# ---- heavy / non-essential (do not commit) ----
+# model checkpoints (download via download_ckpt.py)
+checkpoint/
+# python virtual environment
+.venv/
+# huggingface download cache
+.cache/
+
+# ---- generated at runtime ----
+output/
+single_data/
+*.log
+
+# ---- python bytecode ----
+__pycache__/
+*.py[cod]
