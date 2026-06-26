@@ -12,6 +12,7 @@ MVP limits (see PROGRESS.md): standard MHA only (kv_heads == heads), no rope.
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from diffusers.models.embeddings import apply_rotary_emb
 
 
 def _slice_rows(linear, start, end):
@@ -107,9 +108,6 @@ class TPAttnProcessor:
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
                  attention_mask=None, temb=None, image_rotary_emb=None,
                  *args, **kwargs):
-        if image_rotary_emb is not None:
-            raise NotImplementedError("rope not supported in TP MVP")
-
         residual = hidden_states
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
@@ -151,6 +149,27 @@ class TPAttnProcessor:
             query = attn.norm_q(query)
         if attn.norm_k is not None:
             key = attn.norm_k(key)
+
+        # rope: applied per-head on head_dim (never mixes heads), so running it on
+        # each rank's LOCAL query/key heads is identical to the full-model result.
+        # Logic mirrors the real Attn processor (prefix/suffix split when the rope
+        # table is shorter than the sequence; key only for self-attention).
+        if image_rotary_emb is not None:
+            S_rope = image_rotary_emb[0].shape[0]
+            S = query.shape[2]
+            if S_rope < S:
+                q_prefix = apply_rotary_emb(query[:, :, :S_rope, :], image_rotary_emb)
+                q_suffix = apply_rotary_emb(query[:, :, S_rope:, :], image_rotary_emb)
+                query = torch.cat([q_prefix, q_suffix], dim=2)
+            else:
+                query = apply_rotary_emb(query, image_rotary_emb)
+            if not attn.is_cross_attention:
+                if S_rope < S:
+                    k_prefix = apply_rotary_emb(key[:, :, :S_rope, :], image_rotary_emb)
+                    k_suffix = apply_rotary_emb(key[:, :, S_rope:, :], image_rotary_emb)
+                    key = torch.cat([k_prefix, k_suffix], dim=2)
+                else:
+                    key = apply_rotary_emb(key, image_rotary_emb)
 
         hidden_states = F.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)

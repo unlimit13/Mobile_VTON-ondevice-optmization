@@ -1406,6 +1406,10 @@ class T2IMobilePipelineV1_3_NotLoadingT5_Decoder(T2IMobilePipelineBase):
                         except Exception:
                             pass
                 
+                # [tp-timing] isolate the main-denoiser forward (the only TP-sharded
+                # compute) per step; set TP_TIME=0 to silence. stderr -> run logs.
+                import time as _tp_time, sys as _tp_sys, os as _tp_os
+                _tp_t0 = _tp_time.perf_counter()
                 noise_pred = self.denoiser(
                     sample=latent_model_input,
                     timestep=timestep,
@@ -1414,6 +1418,10 @@ class T2IMobilePipelineV1_3_NotLoadingT5_Decoder(T2IMobilePipelineBase):
                     garment_features=garment_features,
                     added_cond_kwargs=added_cond_kwargs,
                 )[0]
+                if _tp_os.environ.get("TP_TIME", "1") != "0":
+                    print(f"[tp-timing] step {i} denoiser forward: "
+                          f"{_tp_time.perf_counter() - _tp_t0:.2f}s",
+                          file=_tp_sys.stderr, flush=True)
 
                 # perform guidance
                 if self.do_classifier_free_guidance:

@@ -33,11 +33,20 @@ class TiledVaeDecoder:
     `vae_decoder(latents)` call: same (sample, latent_embeds) signature/output.
     """
 
-    def __init__(self, decoder, tile=48, overlap=16, scale=8):
+    def __init__(self, decoder, tile=48, overlap=16, scale=8,
+                 sp_rank=0, sp_world=1, sp_group=None):
         self.decoder = decoder    # the real Decoder module
         self.tile = tile          # latent-space tile size (square)
         self.overlap = overlap    # latent-space overlap between adjacent tiles
         self.scale = scale        # decoder spatial upsample factor (8 for SD VAE)
+        # SPATIAL: the tiled decode is embarrassingly parallel -- the tiles are
+        # already independent and feather-blended. Each rank decodes its slice of
+        # the tile list (round-robin) into a local out/acc, then the two buffers are
+        # summed across ranks with a single pair of all_reduces. N ranks -> ~Nx on
+        # the VAE decode (the pipeline's other big fixed cost). No halo / norm sync.
+        self.sp_rank = sp_rank
+        self.sp_world = sp_world
+        self.sp_group = sp_group
 
     @staticmethod
     def _starts(total, tile, stride):
@@ -72,22 +81,34 @@ class TiledVaeDecoder:
             print(f"[TiledVaeDecoder] input={tuple(sample.shape)} tile={tile} ov={ov} -> {n} tiles",
                   file=sys.stderr, flush=True)
             stride = tile - ov
+            tiles = [(hi, wi) for hi in self._starts(H, tile, stride)
+                     for wi in self._starts(W, tile, stride)]
             out = acc = None
-            for hi in self._starts(H, tile, stride):
-                for wi in self._starts(W, tile, stride):
-                    z = sample[:, :, hi:hi + tile, wi:wi + tile]
-                    img = self.decoder(z, latent_embeds)        # [B, Co, tile*s, tile*s]
-                    th, tw = img.shape[2], img.shape[3]
-                    if out is None:
-                        out = torch.zeros(B, img.shape[1], H * s, W * s, dtype=img.dtype)
-                        acc = torch.zeros(1, 1, H * s, W * s, dtype=img.dtype)
-                    mask = (self._window(th, ov * s).to(img.dtype)[:, None]
-                            * self._window(tw, ov * s).to(img.dtype)[None, :])[None, None]
-                    oh, ow = hi * s, wi * s
-                    out[:, :, oh:oh + th, ow:ow + tw] += img * mask
-                    acc[:, :, oh:oh + th, ow:ow + tw] += mask
-                    del img
-                    gc.collect()
+            for ti, (hi, wi) in enumerate(tiles):
+                # SPATIAL: this rank only decodes its round-robin share of the tiles.
+                if self.sp_world > 1 and (ti % self.sp_world) != self.sp_rank:
+                    continue
+                z = sample[:, :, hi:hi + tile, wi:wi + tile]
+                img = self.decoder(z, latent_embeds)        # [B, Co, tile*s, tile*s]
+                th, tw = img.shape[2], img.shape[3]
+                if out is None:
+                    out = torch.zeros(B, img.shape[1], H * s, W * s, dtype=img.dtype)
+                    acc = torch.zeros(1, 1, H * s, W * s, dtype=img.dtype)
+                mask = (self._window(th, ov * s).to(img.dtype)[:, None]
+                        * self._window(tw, ov * s).to(img.dtype)[None, :])[None, None]
+                oh, ow = hi * s, wi * s
+                out[:, :, oh:oh + th, ow:ow + tw] += img * mask
+                acc[:, :, oh:oh + th, ow:ow + tw] += mask
+                del img
+                gc.collect()
+            if self.sp_world > 1:
+                # a rank that drew no tiles still must join the all_reduces
+                if out is None:
+                    out = torch.zeros(B, 3, H * s, W * s, dtype=sample.dtype)
+                    acc = torch.zeros(1, 1, H * s, W * s, dtype=sample.dtype)
+                import torch.distributed as _dist
+                _dist.all_reduce(out, op=_dist.ReduceOp.SUM, group=self.sp_group)
+                _dist.all_reduce(acc, op=_dist.ReduceOp.SUM, group=self.sp_group)
             return out / acc.clamp_min(1e-6)
 
 import torch
@@ -109,6 +130,12 @@ from transformers import CLIPTextModelWithProjection, CLIPTokenizer
 WORK_DIR = osp.abspath(osp.join(osp.dirname(__file__), "../.."))
 if WORK_DIR not in sys.path:
     sys.path.append(WORK_DIR)
+
+# Repo root (where parallel/ lives) on the path so `--tp` can import the TP code
+# regardless of the cwd the launcher used.
+_REPO_ROOT = osp.dirname(osp.abspath(__file__))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from Mobile_VTON.utils.misc import get_real_path
 from Mobile_VTON.models.autoencoders.vae import Decoder
@@ -182,7 +209,7 @@ class VitonHDTestDataset(data.Dataset):
         im_name = self.im_names[index]
         c_name = self.c_names[index]
 
-        cloth_pil = Image.open(os.path.join(self.dataroot, self.phase, "cloth", c_name))
+        cloth_pil = Image.open(os.path.join(self.dataroot, self.phase, "cloth", c_name)).convert("RGB")
         cloth_trim = self.image_processor(images=cloth_pil, return_tensors="pt").pixel_values  # [1,3,h,w]
 
         # The full_cat pipeline concatenates the garment latent with the person
@@ -191,7 +218,7 @@ class VitonHDTestDataset(data.Dataset):
         # arbitrary-size inputs we must resize here or the cat shapes mismatch.
         cloth_pure = self.transform(cloth_pil.resize((self.width, self.height)))  # [-1,1]
 
-        image_pil = Image.open(os.path.join(self.dataroot, self.phase, "image", im_name)).resize(
+        image_pil = Image.open(os.path.join(self.dataroot, self.phase, "image", im_name)).convert("RGB").resize(
             (self.width, self.height)
         )
         image = self.transform(image_pil)  # [-1,1]
@@ -233,11 +260,51 @@ def parse_args():
     p.add_argument("--checkpoint_path", type=str, required=True,)
     p.add_argument("--scheduler_shift", type=float, default=3.0,)
 
+    # 2-Pi tensor parallelism (see parallel/tp_bootstrap.py). When --tp is set the
+    # SAME command runs on both Pis with different --rank; the main denoiser's
+    # attention is sharded head-parallel across them.
+    p.add_argument("--tp", action="store_true",
+                   help="enable 2-way tensor parallelism across two Pis")
+    p.add_argument("--rank", type=int, default=0, help="TP rank of this process")
+    p.add_argument("--world_size", type=int, default=2, help="number of TP ranks")
+    p.add_argument("--master_addr", type=str, default="192.168.100.1",
+                   help="rank-0 eth0 address for gloo rendezvous")
+    p.add_argument("--master_port", type=int, default=29500)
+    p.add_argument("--tp_iface", type=str, default="eth0",
+                   help="NIC gloo binds to (the direct wired link)")
+    # 2-Pi SPATIAL (H-band) parallelism (see parallel/sp_*.py + SPATIAL_TP_PLAN.md).
+    # DIFFERENT axis from --tp: weights stay full, the feature maps are split along
+    # H across ranks. Splits the whole step (incl. the mem-bound depthwise/GroupNorm/
+    # sampler region that --tp must replicate). Mutually exclusive with --tp.
+    p.add_argument("--spatial", action="store_true",
+                   help="enable 2-way spatial (H-band) parallelism across two Pis")
+    # channels-last (NHWC) memory format: big win for the depthwise/pointwise convs
+    # on the Pi A76 (2-5x on convs in microbench). GroupNorm is slightly slower in
+    # NHWC but tiny vs the conv saving.
+    p.add_argument("--channels_last", action="store_true",
+                   help="run the denoiser convs in channels-last (NHWC) layout")
+
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Bring up the TP process group BEFORE Accelerator so accelerate stays a
+    # single (non-distributed) process and our gloo group owns the default group
+    # that TPAttnProcessor's all_reduce uses.
+    if args.tp and args.spatial:
+        raise SystemExit("--tp and --spatial are mutually exclusive (pick one axis)")
+    tp_rank, tp_world = 0, 1
+    if args.tp or args.spatial:
+        from parallel.tp_bootstrap import init_tp
+        tp_rank, tp_world = init_tp(
+            args.rank, args.world_size, args.master_addr, args.master_port, args.tp_iface)
+        tag = "sp" if args.spatial else "tp"
+        print(f"[{tag}] process group up: rank {tp_rank}/{tp_world} "
+              f"(master {args.master_addr}:{args.master_port}, iface {args.tp_iface})",
+              file=sys.stderr, flush=True)
+    is_writer = (not (args.tp or args.spatial)) or (tp_rank == 0)
 
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
@@ -316,6 +383,88 @@ def main():
     for m in [vae, vae_decoder, text_encoder_one, text_encoder_two, denoiser, denoiser_garment, image_encoder]:
         m.eval().requires_grad_(False)
 
+    # channels-last: convert the conv-heavy nets to NHWC weights AND coerce their
+    # 4D `sample` input to NHWC at forward entry, so the fast layout propagates
+    # through every conv (otherwise a contiguous input forces convs back to NCHW).
+    if args.channels_last:
+        def _to_cl_sample(module, fargs, fkwargs):
+            s = fkwargs.get("sample")
+            if s is not None and s.dim() == 4:
+                fkwargs["sample"] = s.contiguous(memory_format=torch.channels_last)
+            return fargs, fkwargs
+        for _m in (denoiser, denoiser_garment):
+            if _m is not None:
+                _m.to(memory_format=torch.channels_last)
+                _m.register_forward_pre_hook(_to_cl_sample, with_kwargs=True)
+        print("[channels_last] denoiser/garment converted to NHWC", file=sys.stderr, flush=True)
+
+    # TP: shard the main denoiser's attention head-parallel across ranks. Done
+    # after .to(device,dtype)/.eval() (slicing clones in-place at the final dtype)
+    # and before the pipeline runs. Only the per-step main denoiser is sharded;
+    # the garment net stays replicated (it runs once, then gets cached).
+    if args.tp:
+        from parallel.tp_attention import shard_denoiser_attention_
+        from parallel.tp_conv import shard_denoiser_conv_
+        sharded, skipped = shard_denoiser_attention_(denoiser, tp_rank, tp_world)
+        print(f"[tp] rank {tp_rank}: sharded {len(sharded)} / skipped {len(skipped)} "
+              f"denoiser attention modules", file=sys.stderr, flush=True)
+        # Stage 1b: channel-parallel the resnet pointwise convs (the heavy bulk).
+        cdone, cskip = shard_denoiser_conv_(denoiser, tp_rank, tp_world)
+        print(f"[tp] rank {tp_rank}: sharded {len(cdone)} / skipped {len(cskip)} "
+              f"denoiser resnet blocks (channel-parallel conv)", file=sys.stderr, flush=True)
+        # Stage 2: Megatron-MLP shard the transformer FFN (~48% of params).
+        from parallel.tp_ffn import shard_denoiser_ffn_
+        fdone, fskip = shard_denoiser_ffn_(denoiser, tp_rank, tp_world)
+        print(f"[tp] rank {tp_rank}: sharded {len(fdone)} / skipped {len(fskip)} "
+              f"denoiser FFN modules", file=sys.stderr, flush=True)
+
+    # SPATIAL (H-band): patch GroupNorm (stat all_reduce), convs (halo) + samplers
+    # (gather-full), and transformer attentions (self: person K/V all_gather; cross:
+    # query-parallel). Then wrap the denoiser so its `sample` is scattered into this
+    # rank's row band on entry and the output gathered back to full on exit -- the
+    # pipeline still sees a normal full-in/full-out denoiser. All non-spatial inputs
+    # (text/garment/image embeds, timestep) stay replicated.
+    if args.spatial:
+        from parallel.sp_groupnorm import shard_denoiser_groupnorm_
+        from parallel.sp_conv import shard_denoiser_spatial_conv_
+        from parallel.sp_attention import shard_denoiser_spatial_attention_
+        from parallel.sp_common import scatter_rows, gather_rows
+        # Spatial keeps the MAIN denoiser's weights full (each rank computes all
+        # channels for its row band). To keep the model-loading peak under the Pi's
+        # RAM, CHANNEL-parallel shard the GARMENT denoiser instead: it runs once, its
+        # all_reduced output is full/replicated (exactly what the main self-attn keys
+        # need), and halving its weights claws back the headroom spatial loses on the
+        # main net. Skippable via SP_NO_GARMENT_TP=1.
+        if tp_world > 1 and os.environ.get("SP_NO_GARMENT_TP") != "1":
+            from parallel.tp_attention import shard_denoiser_attention_ as _cta
+            from parallel.tp_conv import shard_denoiser_conv_ as _ctc
+            from parallel.tp_ffn import shard_denoiser_ffn_ as _ctf
+            ga, _ = _cta(denoiser_garment, tp_rank, tp_world)
+            gc, _ = _ctc(denoiser_garment, tp_rank, tp_world)
+            gf, _ = _ctf(denoiser_garment, tp_rank, tp_world)
+            print(f"[sp] rank {tp_rank}: garment denoiser channel-TP sharded "
+                  f"attn={len(ga)} conv={len(gc)} ffn={len(gf)}", file=sys.stderr, flush=True)
+        ngn = shard_denoiser_groupnorm_(denoiser)
+        nhalo, nsamp = shard_denoiser_spatial_conv_(denoiser)
+        if os.environ.get("SP_SKIP_ATTN") == "1":
+            nt, na = 0, 0
+            print("[sp] SP_SKIP_ATTN=1 -> attention left replicated (bisect)", file=sys.stderr, flush=True)
+        else:
+            nt, na = shard_denoiser_spatial_attention_(denoiser)
+        print(f"[sp] rank {tp_rank}: spatial-sharded groupnorm={ngn} halo_conv={nhalo} "
+              f"samplers={nsamp} transformers={nt} attn={na}", file=sys.stderr, flush=True)
+
+        _orig_denoiser_forward = type(denoiser).forward
+
+        def _spatial_denoiser_forward(sample, *a, **k):
+            sample = scatter_rows(sample, tp_rank, tp_world)
+            out = _orig_denoiser_forward(denoiser, sample, *a, **k)
+            if isinstance(out, tuple):
+                return (gather_rows(out[0], tp_rank, tp_world),) + out[1:]
+            out.sample = gather_rows(out.sample, tp_rank, tp_world)
+            return out
+        denoiser.forward = _spatial_denoiser_forward
+
     # Tile/slice the VAE so the encode step never materializes the full-res
     # feature map at once (big peak-memory win at high resolution).
     try:
@@ -340,8 +489,12 @@ def main():
     # Swap the decoder for a tiled wrapper so the final full-res decode (the
     # pipeline's peak-RAM stage) never allocates the whole feature map at once.
     # object.__setattr__ bypasses the diffusers pipeline's module registration.
-    object.__setattr__(pipe, "vae_decoder", TiledVaeDecoder(vae_decoder, tile=32, overlap=8))
-    print("[lowmem] tiled vae_decoder installed:", type(pipe.vae_decoder).__name__,
+    # SPATIAL: distribute the decode tiles across ranks (round-robin) + all_reduce.
+    _vae_sp = dict(sp_rank=tp_rank, sp_world=tp_world) if args.spatial else {}
+    object.__setattr__(pipe, "vae_decoder",
+                       TiledVaeDecoder(vae_decoder, tile=32, overlap=8, **_vae_sp))
+    print(f"[lowmem] tiled vae_decoder installed: {type(pipe.vae_decoder).__name__}"
+          + (f" (spatial tiles across {tp_world} ranks)" if args.spatial else ""),
           file=sys.stderr, flush=True)
 
     # Drop main()'s own references to vae / image_encoder so that when the
@@ -454,17 +607,23 @@ def main():
                     device=pipe_device,
                 )[0]
 
-            for i, pil_img in enumerate(images):
-                im_name = batch["im_name"][i]
-                c_name = batch["c_name"][i]
-                out_name = f"{im_name[:-4]}_{c_name}"
-                x = pil_to_tensor(pil_img)
-                torchvision.utils.save_image(x, os.path.join(args.output_dir, out_name))
+            # Both ranks produce identical images (SPMD); only the writer saves
+            # so the two Pis don't race on the same output files.
+            if is_writer:
+                for i, pil_img in enumerate(images):
+                    im_name = batch["im_name"][i]
+                    c_name = batch["c_name"][i]
+                    out_name = f"{im_name[:-4]}_{c_name}"
+                    x = pil_to_tensor(pil_img)
+                    torchvision.utils.save_image(x, os.path.join(args.output_dir, out_name))
 
             progress.update(1)
 
     progress.close()
-    if accelerator.is_main_process:
+    if args.tp or args.spatial:
+        from parallel.tp_bootstrap import shutdown_tp
+        shutdown_tp()
+    if is_writer:
         print(f"Done. Saved to: {args.output_dir}")
 
 
