@@ -73,7 +73,11 @@ done
 All four fields OK + matching `code=` hash on every Pi → ready to launch.
 
 ## Status snapshot (2026-06-26)
-- .1 rank0: ready (this Pi).
-- .2 rank1: ready (clone + venv + 3.5G ckpt + sp code synced + passwordless ssh).
-- .3 rank2: pings, but **passwordless SSH not set up** + repo/ckpt not provisioned.
+Code is committed + pushed to origin/master @ 994d193, so a fresh clone now brings
+the full spatial + channel-TP code and the cloth3/person2 test samples.
+- .1 rank0: ready (this Pi; has the code, venv, ckpt).
+- .2 rank1: ready (clone + venv + 3.5G ckpt + passwordless ssh). Run `git pull` to
+  pick up 994d193 before the next run.
+- .3 rank2: pings, but **passwordless SSH not set up** + repo/ckpt not provisioned
+  (do the EVERY-Pi steps above).
 - .4 rank3: **down** (no eth0 IP / power / cable) + not provisioned.

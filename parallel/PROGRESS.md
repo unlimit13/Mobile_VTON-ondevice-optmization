@@ -4,13 +4,30 @@
 the main denoiser, over the direct wired GbE link between two Pi 5s.
 
 ## ▶ RESUME HERE (updated 2026-06-26)
-SPATIAL parallelism (parallel/sp_*.py, `--spatial`) is DONE + VERIFIED on 2 Pis:
-equivalent to channel-TP/single (max|diff|=4) and **67.9s/step = 1.26x faster than
-channel-TP (85.4s)** -- it splits the mem-bound depthwise/GroupNorm/sampler ~47%.
-Run it with `bash parallel/run_sp_pair.sh <steps> <outdir>` (garment denoiser is
-auto channel-TP'd to fit RAM). Next levers: (a) make self-attn sequence-parallel
-key gather overlap; (b) step-count distillation (linear, biggest); (c) combine
-spatial x channel for 4 Pis. Old channel-TP resume notes below.
+STATE: all code COMMITTED + PUSHED to origin/master @ **994d193** (was previously
+all uncommitted). Cluster standard is now **4 Pis** (.1 main/rank0 .. .4); see
+`parallel/PI_SETUP.md` + `parallel/SPATIAL_4PI.md` + memory `multi-pi-cluster`.
+
+DONE + VERIFIED on 2 Pis:
+- SPATIAL (H-band) parallelism (parallel/sp_*.py, `--spatial`): equivalent to
+  channel-TP/single (max|diff|=4) and **67.9s/step = 1.26x faster than channel-TP
+  (85.4s)** -- splits the mem-bound depthwise/GroupNorm/sampler ~47%. garment
+  denoiser auto channel-TP'd to fit RAM. world-agnostic; world=4 math-verified on
+  localhost (sp_test_conv.py 4 = 14/14).
+- VAE decode spatial split (tile round-robin + 2 all_reduce): equivalent, ~Nx.
+
+RUN (4-Pi default): `bash parallel/run_sp_multi.sh 6 output/spatial`
+(2-Pi: pass "192.168.100.2" as the 4th arg, or use run_sp_pair.sh).
+
+NEXT (resume here):
+1. Bring up the cluster: .3 needs passwordless SSH; .4 is down (IP/power/cable);
+   provision .3/.4 per PI_SETUP.md (clone+setup_env+download_ckpt). .2 just `git pull`.
+2. FIRST REAL 4-Pi RUN is unproven -> smoke-test 1 step (correctness + does it FIT
+   in RAM: garment channel-TP only partially shards at world=4 since 14 heads % 4),
+   then 6 steps. Watch switch-latency on the many small collectives.
+3. Bigger latency levers: step-count distillation (linear, biggest, needs training);
+   overlap self-attn person-K/V all_gather with compute; 4-Pi spatial x channel hybrid.
+Old channel-TP resume notes below.
 
 ## ▶ RESUME (channel-TP, historical)
 Stages 1 + 1b + 2 (attention + channel-parallel conv + Megatron-MLP FFN) DONE +
